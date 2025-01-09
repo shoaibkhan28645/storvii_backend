@@ -36,6 +36,7 @@ function getRoomParticipants(roomId) {
   }
 
   const roomParticipants = Array.from(rooms.get(roomId).values());
+
   return {
     count: roomParticipants.length,
     participants: roomParticipants,
@@ -60,7 +61,7 @@ app.post("/rooms", verifyToken, async (req, res) => {
   try {
     console.log("Creating new room:", req.body);
     const { name, roomType, roomThumbnail, roomTheme } = req.body;
-    const expirationDuration = 24 * 60 * 60 * 1000; // Room lifespan: 24 hours
+    const expirationDuration = 1 * 60 * 60 * 1000; // Room lifespan: 24 hours
     const expiresAt = new Date(Date.now() + expirationDuration);
 
     const newRoom = new Room({
@@ -134,69 +135,6 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("user-unmuted", userId); // Add this line
   });
 
-  socket.on("report-user", async ({ reportedUserId, reporterId }, callback) => {
-    // Add debug logs
-    console.log("Received report request:", { reportedUserId, reporterId });
-
-    try {
-      // Validate input and log the validation check
-      if (!reportedUserId || !reporterId) {
-        console.log("Invalid IDs:", { reportedUserId, reporterId });
-        return callback({
-          success: false,
-          message: "Invalid user IDs provided",
-        });
-      }
-
-      console.log("Looking up users with IDs:", { reportedUserId, reporterId });
-
-      const [reportedUser, reporter] = await Promise.all([
-        User.findById(reportedUserId),
-        User.findById(reporterId),
-      ]);
-
-      console.log("Found users:", {
-        reportedUser: reportedUser ? "exists" : "not found",
-        reporter: reporter ? "exists" : "not found",
-      });
-
-      if (!reportedUser) {
-        return callback({
-          success: false,
-          message: "Reported user not found",
-        });
-      }
-
-      if (!reporter) {
-        return callback({
-          success: false,
-          message: "Reporter not found",
-        });
-      }
-
-      // Decrease reputation
-      reportedUser.reputationLevel = Math.max(
-        0,
-        (reportedUser.reputationLevel || 70) - 5
-      );
-      await reportedUser.save();
-
-      console.log("Updated reputation level:", reportedUser.reputationLevel);
-
-      callback({
-        success: true,
-        message: "User reported successfully",
-        newReputationLevel: reportedUser.reputationLevel,
-      });
-    } catch (error) {
-      console.error("Error handling user report:", error);
-      callback({
-        success: false,
-        message: "An error occurred while processing the report",
-      });
-    }
-  });
-
   socket.on("mute-all", (roomId) => {
     // Notify all users in the room to mute their audio
     io.to(roomId).emit("mute-all");
@@ -236,7 +174,7 @@ io.on("connection", (socket) => {
 
         // Notify others and update participant list
         socket.to(roomId).emit("user-kicked", userId);
-        const participantsInfo = getRoomParticipants(roomId);
+        const participancltsInfo = getRoomParticipants(roomId);
         io.to(roomId).emit("participants-update", participantsInfo);
       }
     }
@@ -245,7 +183,7 @@ io.on("connection", (socket) => {
   socket.on("join-room", async (roomId, userId, userData = {}) => {
     try {
       currentRoom = roomId;
-      currentUserId = userId;
+      currentUserId = userData.id;
 
       // Initialize room if it doesn't exist
       if (!rooms.has(roomId)) {
@@ -254,11 +192,12 @@ io.on("connection", (socket) => {
 
       // Add user to room with complete user data
       rooms.get(roomId).set(userId, {
-        userId: userData._id, // MongoDB _id
-        username: userData.username, // Username for display
+        userId: userId, // Use the socket's userId as fallback
+        socketId: socket.id,
         fullName: userData.fullName || "Anonymous User",
         profilePic: userData.profilePic || null,
         isAnonymous: !userData.fullName,
+        mongoId: currentUserId, // Store MongoDB _id separately if available
       });
 
       // Join the socket room
@@ -271,7 +210,7 @@ io.on("connection", (socket) => {
       io.to(roomId).emit("participants-update", participantsInfo);
 
       // Notify others about the new user
-      socket.to(roomId).emit("user-joined", userId);
+      socket.to(roomId).emit("user-joined", userData);
 
       // Set up periodic sync for this room
       const syncInterval = setInterval(() => {

@@ -213,6 +213,7 @@ router.post("/google-signin", async (req, res) => {
     if (!user) {
       // Create a new user if not found
       user = new User({
+        id: new mongoose.Types.ObjectId(),
         fullName: name,
         username: email.split("@")[0], // Use part of email as username
         email,
@@ -274,6 +275,57 @@ router.get("/user", verifyToken, async (req, res) => {
     res
       .status(500)
       .json({ error: "Error fetching user data", details: error.message });
+  }
+});
+
+router.post("/report-user", verifyToken, async (req, res) => {
+  try {
+    const { reportedUserId, reason } = req.body;
+    console.log("Received report data:", { reportedUserId, reason });
+
+    // Check if reportedUserId is a valid MongoDB ObjectId
+    if (!mongoose.Types.ObjectId.isValid(reportedUserId)) {
+      console.log("Invalid reportedUserId:", reportedUserId);
+      return res.status(400).json({ error: "Invalid user ID format" });
+    }
+
+    const reportedUser = await User.findById(reportedUserId);
+    console.log("reportedUser:", reportedUser);
+
+    if (!reportedUser) {
+      return res.status(404).json({ error: "Reported user not found" });
+    }
+
+    // Optional: Store the report in a new Reports collection
+    const Report = mongoose.model("Report", {
+      reportedUser: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+      reportedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+      reason: String,
+      timestamp: { type: Date, default: Date.now },
+    });
+
+    await new Report({
+      reportedUser: reportedUserId,
+      reportedBy: req.userId,
+      reason,
+    }).save();
+
+    const newReputation = Math.max(0, reportedUser.reputationLevel - 5);
+
+    await User.findByIdAndUpdate(reportedUserId, {
+      reputationLevel: newReputation,
+    });
+
+    res.json({
+      message: "User reported successfully",
+      newReputationLevel: newReputation,
+    });
+  } catch (error) {
+    console.error("Error in report-user route:", error);
+    res.status(500).json({
+      error: "Error reporting user",
+      details: "The user is already reported",
+    });
   }
 });
 
