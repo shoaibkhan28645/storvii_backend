@@ -7,6 +7,7 @@ const { OAuth2Client } = require("google-auth-library");
 const nodemailer = require("nodemailer");
 const multer = require("multer");
 const path = require("path");
+const Report = require("../models/Report");
 
 const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
@@ -195,17 +196,33 @@ router.post("/login", async (req, res) => {
 });
 
 // Google Sign-In route
+const verifyGoogleIdToken = async (idToken) => {
+  let retries = 3;
+  while (retries > 0) {
+    try {
+      const ticket = await client.verifyIdToken({
+        idToken,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      });
+      return ticket.getPayload(); // Return the payload if verification succeeds
+    } catch (err) {
+      retries -= 1;
+      if (retries === 0) throw err; // Throw error after exhausting retries
+      console.error(
+        `Google ID Token verification failed. Retries left: ${retries}`
+      );
+      await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait before retrying
+    }
+  }
+};
+
 router.post("/google-signin", async (req, res) => {
   try {
     const { idToken } = req.body;
-    console.log("Received idToken:", idToken);
 
-    const ticket = await client.verifyIdToken({
-      idToken: idToken,
-      audience: process.env.GOOGLE_CLIENT_ID,
-    });
-    const payload = ticket.getPayload();
-    console.log("Payload:", payload);
+    // Use the new verifyGoogleIdToken function
+    const payload = await verifyGoogleIdToken(idToken);
+    console.log("Verified Payload:", payload);
 
     const { name, email, sub, picture } = payload;
 
@@ -230,9 +247,10 @@ router.post("/google-signin", async (req, res) => {
     res.json({ token: jwtToken });
   } catch (error) {
     console.error("Google Sign-In Error:", error);
-    res
-      .status(500)
-      .json({ error: "Error with Google Sign-In", details: error.message });
+    res.status(500).json({
+      error: "Error with Google Sign-In",
+      details: error.message,
+    });
   }
 });
 
@@ -280,29 +298,40 @@ router.get("/user", verifyToken, async (req, res) => {
 
 router.post("/report-user", verifyToken, async (req, res) => {
   try {
+    console.log("req.userId:", req.userId);
+
     const { reportedUserId, reason } = req.body;
     console.log("Received report data:", { reportedUserId, reason });
 
     // Check if reportedUserId is a valid MongoDB ObjectId
     if (!mongoose.Types.ObjectId.isValid(reportedUserId)) {
-      console.log("Invalid reportedUserId:", reportedUserId);
-      return res.status(400).json({ error: "Invalid user ID format" });
+      return res.status(400).json({
+        error: "Invalid user ID format",
+        details: "The reported user's ID is not a valid Mongo ObjectId",
+      });
     }
 
     const reportedUser = await User.findById(reportedUserId);
     console.log("reportedUser:", reportedUser);
 
     if (!reportedUser) {
-      return res.status(404).json({ error: "Reported user not found" });
+      return res.status(404).json({
+        error: "Reported user not found",
+        details: `No user found with the ID: ${reportedUserId}`,
+      });
     }
 
-    // Optional: Store the report in a new Reports collection
-    const Report = mongoose.model("Report", {
-      reportedUser: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
-      reportedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
-      reason: String,
-      timestamp: { type: Date, default: Date.now },
+    const existingReport = await Report.findOne({
+      reportedUser: reportedUserId,
+      reportedBy: req.userId,
     });
+
+    if (existingReport) {
+      return res.status(400).json({
+        error: "User already reported",
+        details: "You have already reported this user.",
+      });
+    }
 
     await new Report({
       reportedUser: reportedUserId,
@@ -322,9 +351,19 @@ router.post("/report-user", verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.error("Error in report-user route:", error);
+
+    // If it's a 'duplicate key error' from Mongo, e.g. unique index on (reportedUser, reportedBy)
+    if (error.code === 11000) {
+      return res.status(400).json({
+        error: "User already reported",
+        details: "You have already reported this user before.",
+      });
+    }
+
+    // Otherwise a general error
     res.status(500).json({
       error: "Error reporting user",
-      details: "The user is already reported",
+      details: error.message || "An unknown error occurred.",
     });
   }
 });

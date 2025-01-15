@@ -13,6 +13,7 @@ const { User } = require("../auth/auth"); // Import the User model
 
 const mongoose = require("mongoose");
 const { router: authRouter, verifyToken } = require("../auth/auth");
+const kickedUsersMap = new Map();
 
 // Add body parser middleware
 app.use(express.json());
@@ -21,6 +22,8 @@ mongoose
   .connect(process.env.MONGODB_URI, {
     useNewUrlParser: true,
     useUnifiedTopology: true,
+    connectTimeoutMS: 30000, // Increase connection timeout
+    socketTimeoutMS: 45000, // Increase socket timeout
   })
   .then(() => console.log("Connected to MongoDB Atlas"))
   .catch((err) => console.error("Could not connect to MongoDB Atlas", err));
@@ -132,49 +135,66 @@ io.on("connection", (socket) => {
 
   socket.on("unmute-user", (roomId, userId) => {
     io.to(userId).emit("unmute-user");
-    io.to(roomId).emit("user-unmuted", userId); // Add this line
+    io.to(roomId).emit("user-unmuted", { userId, forced: true });
   });
 
   socket.on("mute-all", (roomId) => {
-    // Notify all users in the room to mute their audio
-    io.to(roomId).emit("mute-all");
+    const room = rooms.get(roomId);
+    if (room) {
+      for (const [socketId, userInfo] of room.entries()) {
+        if (socketId === socket.id) {
+          // Skip the host
+          continue;
+        }
+        io.to(socketId).emit("mute-user");
+        io.to(roomId).emit("user-muted", { userId: socketId, forced: true });
+      }
+    }
+  });
+
+  socket.on("unmute-all", (roomId) => {
+    const room = rooms.get(roomId);
+    if (room) {
+      // For each participant in the room, forcibly unmute them
+      for (const [socketId, userInfo] of room.entries()) {
+        io.to(socketId).emit("unmute-user");
+        // Also broadcast the "user-unmuted" event with forced: true
+        io.to(roomId).emit("user-unmuted", { userId: socketId, forced: true });
+      }
+    }
   });
 
   socket.on("mute-user", (roomId, userId) => {
     io.to(userId).emit("mute-user");
-    io.to(roomId).emit("user-muted", userId); // Add this line
+    io.to(roomId).emit("user-muted", { userId, forced: true });
   });
 
-  socket.on("kick-user", (roomId, userId) => {
-    console.log("Kicking user:", userId, "from room:", roomId);
+  socket.on("self-mute", ({ roomId, userId }) => {
+    io.to(roomId).emit("user-muted", { userId, forced: false });
+  });
 
-    // Get all socket IDs for the user in this room
+  socket.on("self-unmute", ({ roomId, userId }) => {
+    io.to(roomId).emit("user-unmuted", { userId, forced: false });
+  });
+
+  socket.on("kick-user", (roomId, socketIdToKick) => {
     const room = rooms.get(roomId);
     if (room) {
-      // Get user info to identify all their connections
-      const userInfo = Array.from(room.values()).find(
-        (user) => user.userId === userId || user.socketId === userId
-      );
+      const userObj = room.get(socketIdToKick);
+      if (userObj) {
+        io.to(socketIdToKick).emit("kicked");
+        room.delete(socketIdToKick);
+        const kickedSocket = io.sockets.sockets.get(socketIdToKick);
+        if (kickedSocket) {
+          kickedSocket.leave(roomId);
+        }
 
-      if (userInfo) {
-        // Find all sockets belonging to this user
-        const userSockets = Array.from(room.entries())
-          .filter(([socketId, user]) => user.fullName === userInfo.fullName)
-          .map(([socketId]) => socketId);
+        if (!kickedUsersMap.has(roomId)) {
+          kickedUsersMap.set(roomId, new Set());
+        }
+        kickedUsersMap.get(roomId).add(userObj.mongoId);
 
-        // Kick all connections for this user
-        userSockets.forEach((socketId) => {
-          io.to(socketId).emit("kicked");
-          room.delete(socketId);
-          const kickedSocket = io.sockets.sockets.get(socketId);
-          if (kickedSocket) {
-            kickedSocket.leave(roomId);
-          }
-        });
-
-        // Notify others and update participant list
-        socket.to(roomId).emit("user-kicked", userId);
-        const participancltsInfo = getRoomParticipants(roomId);
+        const participantsInfo = getRoomParticipants(roomId);
         io.to(roomId).emit("participants-update", participantsInfo);
       }
     }
@@ -182,6 +202,16 @@ io.on("connection", (socket) => {
 
   socket.on("join-room", async (roomId, userId, userData = {}) => {
     try {
+      const userMongoId = userData.id;
+      if (
+        kickedUsersMap.has(roomId) &&
+        kickedUsersMap.get(roomId).has(userMongoId)
+      ) {
+        console.log(`User ${userMongoId} is banned from room ${roomId}`);
+        socket.emit("kicked");
+        return;
+      }
+
       currentRoom = roomId;
       currentUserId = userData.id;
 
@@ -191,13 +221,12 @@ io.on("connection", (socket) => {
       }
 
       // Add user to room with complete user data
-      rooms.get(roomId).set(userId, {
-        userId: userId, // Use the socket's userId as fallback
-        socketId: socket.id,
+      rooms.get(roomId).set(socket.id, {
+        userId: socket.id,
+        mongoId: userData.id, // If you also want the MongoDB _id
         fullName: userData.fullName || "Anonymous User",
         profilePic: userData.profilePic || null,
         isAnonymous: !userData.fullName,
-        mongoId: currentUserId, // Store MongoDB _id separately if available
       });
 
       // Join the socket room
@@ -205,12 +234,14 @@ io.on("connection", (socket) => {
 
       // Get updated participants info
       const participantsInfo = getRoomParticipants(roomId);
-
-      // Broadcast to everyone in the room, including the sender
       io.to(roomId).emit("participants-update", participantsInfo);
 
       // Notify others about the new user
-      socket.to(roomId).emit("user-joined", userData);
+      socket.to(roomId).emit("user-joined", {
+        id: socket.id, // This is typically the real ID for WebRTC
+        fullName: userData.fullName || "Anonymous User",
+        profilePic: userData.profilePic || null,
+      });
 
       // Set up periodic sync for this room
       const syncInterval = setInterval(() => {
